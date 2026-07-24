@@ -129,11 +129,10 @@ split_boot() {
   elif [ -f "$bin/rkcrc" ]; then
     dd bs=4096 skip=8 iflag=skip_bytes conv=notrunc if=$bootimg of=ramdisk.cpio.gz;
   else
-    (set -o pipefail; timeout 20s $bin/magiskboot unpack -h $bootimg 2>&1 | tee infotmp >&2);
+    (set -o pipefail; $bin/magiskboot unpack -h $bootimg 2>&1 | tee infotmp >&2);
     case $? in
-      0|3) ;;
+      1) splitfail=1;;
       2) touch chromeos;;
-      *) splitfail=1;;
     esac;
   fi;
 
@@ -146,8 +145,6 @@ split_boot() {
 # unpack_ramdisk (extract ramdisk only)
 unpack_ramdisk() {
   local comp;
-  local cpio_file;
-  local cpio_files;
 
   cd $split_img;
   if [ -f ramdisk.cpio.gz ]; then
@@ -160,14 +157,6 @@ unpack_ramdisk() {
 
   if [ -f ramdisk.cpio ]; then
     comp=$($bin/magiskboot decompress ramdisk.cpio 2>&1 | grep -v 'raw' | sed -n 's;.*\[\(.*\)\];\1;p');
-  elif [ -d vendor_ramdisk ]; then
-    # If the vendor_ramdisk directory exists, it means that the image was unpacked by magiskboot,
-    # and the cpio archive files must have been decompressed during the unpacking process.
-    # Therefore, we skip setting the `comp` variable here, and we don't need to determine the compression algorithm.
-    if [ ! -f vendor_ramdisk/ramdisk.cpio ]; then
-      abort "Unsupported ramdisk file format. Aborting...";
-    fi;
-    cpio_files="$split_img/vendor_ramdisk/ramdisk.cpio $(ls -1 $split_img/vendor_ramdisk/*.cpio | grep -vE '/ramdisk\.cpio$')";
   else
     abort "No ramdisk found to unpack. Aborting...";
   fi;
@@ -185,16 +174,7 @@ unpack_ramdisk() {
   chmod 755 $ramdisk;
 
   cd $ramdisk;
-  if [ "$cpio_files" ]; then
-    # Unpack all vendor ramdisk cpio
-    for cpio_file in ${cpio_files}; do
-      ui_print "- Unpacking $(basename $cpio_file)...";
-      $bin/magiskboot cpio $cpio_file extract;
-    done;
-  else
-    ui_print "- Unpacking ramdisk.cpio...";
-    $bin/magiskboot cpio $split_img/ramdisk.cpio extract;
-  fi
+  EXTRACT_UNSAFE_SYMLINKS=1 cpio -d -F $split_img/ramdisk.cpio -i;
   if [ $? != 0 -o ! "$(ls)" ]; then
     abort "Unpacking ramdisk failed. Aborting...";
   fi;
@@ -229,21 +209,20 @@ repack_ramdisk() {
     *) comp=$ramdisk_compression;;
   esac;
 
-  ui_print "- Repacking ramdisk.cpio...";
   if [ -f "$bin/mkbootfs" ]; then
     $bin/mkbootfs $ramdisk > ramdisk-new.cpio;
   else
     cd $ramdisk;
-    find . | grep -vE '^\.$' | sort | cpio -H newc -o > $home/ramdisk-new.cpio;
+    find . | cpio -H newc -o > $home/ramdisk-new.cpio;
   fi;
   [ $? != 0 ] && packfail=1;
 
   cd $home;
-  if [ ! "$no_magisk_check" ] && [ ! "$magisk_patched" ]; then
+  if [ ! "$no_magisk_check" ]; then
     $bin/magiskboot cpio ramdisk-new.cpio test;
     magisk_patched=$?;
-    [ "$magisk_patched" -eq 1 ] && $bin/magiskboot cpio ramdisk-new.cpio "extract .backup/.magisk $split_img/.magisk";
   fi;
+  [ $((magisk_patched & 3)) -eq 1 ] && $bin/magiskboot cpio ramdisk-new.cpio "extract .backup/.magisk $split_img/.magisk";
   if [ "$comp" ]; then
     $bin/magiskboot compress=$comp ramdisk-new.cpio;
     if [ $? != 0 ] && $comp --help 2>/dev/null; then
@@ -267,7 +246,7 @@ repack_ramdisk() {
 
 # flash_boot (build, sign and write image only)
 flash_boot() {
-  local varlist i f kernel ramdisk fdt cmdline comp part0 part1 nocompflag signfail pk8 cert avbtype;
+  local varlist i kernel ramdisk fdt cmdline comp part0 part1 nocompflag signfail pk8 cert avbtype;
 
   cd $split_img;
   if [ -f "$bin/mkimage" ]; then
@@ -337,18 +316,7 @@ flash_boot() {
     $bin/mkbootimg --kernel $kernel --ramdisk $ramdisk --cmdline "$cmdline" --base $base --pagesize $pagesize --kernel_offset $kernel_offset --ramdisk_offset $ramdisk_offset --tags_offset "$tags_offset" $dt --output $home/boot-new.img;
   else
     [ "$kernel" ] && cp -f $kernel kernel;
-    if [ "$ramdisk" ]; then
-      if [ -d vendor_ramdisk ]; then
-        # Replace all vendor ramdisk cpio archives with empty cpio ones
-        for f in vendor_ramdisk/*.cpio; do
-          cp -f $bin/_extra/empty.cpio $f;
-        done;
-        # Then, replace the original ramdisk.cpio with the integrated and repackaged ramdisk.cpio
-        mv -f $ramdisk vendor_ramdisk/ramdisk.cpio;
-      else
-        cp -f $ramdisk ramdisk.cpio;
-      fi;
-    fi;
+    [ "$ramdisk" ] && cp -f $ramdisk ramdisk.cpio;
     [ "$dt" -a -f extra ] && cp -f $dt extra;
     for i in dtb recovery_dtbo; do
       [ "$(eval echo \$$i)" -a -f $i ] && cp -f $(eval echo \$$i) $i;
@@ -359,7 +327,7 @@ flash_boot() {
           $bin/magiskboot cpio ramdisk.cpio test;
           magisk_patched=$?;
         fi;
-        if [ "$magisk_patched" -eq 1 -a ! "$no_magisk_check" ]; then
+        if [ $((magisk_patched & 3)) -eq 1 ]; then
           ui_print " " "Magisk detected! Patching kernel so reflashing Magisk is not necessary...";
           comp=$($bin/magiskboot decompress kernel 2>&1 | grep -vE 'raw|zimage' | sed -n 's;.*\[\(.*\)\];\1;p');
           ($bin/magiskboot split $kernel || $bin/magiskboot decompress $kernel kernel) 2>/dev/null;
@@ -369,7 +337,7 @@ flash_boot() {
           fi;
           # legacy SAR kernel string skip_initramfs -> want_initramfs
           $bin/magiskboot hexpatch kernel 736B69705F696E697472616D6673 77616E745F696E697472616D6673;
-          if [ "$(file_getprop $home/anykernel.sh do.modules)" == 1 ] && [ "$(file_getprop $home/anykernel.sh do.systemless)" == 1 ] && [ ! -f $home/vertmp ]; then
+          if [ "$(file_getprop $home/anykernel.sh do.modules)" == 1 ] && [ "$(file_getprop $home/anykernel.sh do.systemless)" == 1 ]; then
             strings kernel 2>/dev/null | grep -E -m1 'Linux version.*#' > $home/vertmp;
           fi;
           if [ "$comp" ]; then
@@ -540,20 +508,20 @@ flash_generic() {
           echo "Resizing $1$slot snapshot..." >&2;
           $bin/snapshotupdater_static update $1 $imgsz || abort "Resizing $1$slot snapshot failed. Aborting...";
         else
-          echo "Removing any existing ${1}_ak3..." >&2;
-          $bin/lptools_static remove ${1}_ak3;
+          echo "Removing any existing $1_ak3..." >&2;
+          $bin/lptools_static remove $1_ak3;
           echo "Clearing any merged cow partitions..." >&2;
           $bin/lptools_static clear-cow;
-          echo "Attempting to create ${1}_ak3..." >&2;
-          if $bin/lptools_static create ${1}_ak3 $imgsz; then
-            echo "Replacing $1$slot with ${1}_ak3..." >&2;
-            $bin/lptools_static unmap ${1}_ak3 || abort "Unmapping ${1}_ak3 failed. Aborting...";
-            $bin/lptools_static map ${1}_ak3 || abort "Mapping ${1}_ak3 failed. Aborting...";
-            $bin/lptools_static replace ${1}_ak3 $1$slot || abort "Replacing $1$slot failed. Aborting...";
-            imgblock=/dev/block/mapper/${1}_ak3;
+          echo "Attempting to create $1_ak3..." >&2;
+          if $bin/lptools_static create $1_ak3 $imgsz; then
+            echo "Replacing $1$slot with $1_ak3..." >&2;
+            $bin/lptools_static unmap $1_ak3 || abort "Unmapping $1_ak3 failed. Aborting...";
+            $bin/lptools_static map $1_ak3 || abort "Mapping $1_ak3 failed. Aborting...";
+            $bin/lptools_static replace $1_ak3 $1$slot || abort "Replacing $1$slot failed. Aborting...";
+            imgblock=/dev/block/mapper/$1_ak3;
             ui_print " " "Warning: $1$slot replaced in super. Reboot before further logical partition operations.";
           else
-            echo "Creating ${1}_ak3 failed. Attempting to resize $1$slot..." >&2;
+            echo "Creating $1_ak3 failed. Attempting to resize $1$slot..." >&2;
             $bin/httools_static umount $1 || abort "Unmounting $1 failed. Aborting...";
             if [ -e $path/$1-verity ]; then
               $bin/lptools_static unmap $1-verity || abort "Unmapping $1-verity failed. Aborting...";
@@ -811,10 +779,19 @@ patch_ueventd() {
 ### configuration/setup functions:
 # reset_ak [keep]
 reset_ak() {
-  local i;
+  local current i;
 
+  current=$(dirname $home/*-files/current);
+  if [ -d "$current" ]; then
+    for i in $bootimg $home/boot-new.img; do
+      [ -e $i ] && cp -af $i $current;
+    done;
+    for i in $current/*; do
+      [ -f $i ] && rm -f $home/$(basename $i);
+    done;
+  fi;
   [ -d $split_img ] && rm -rf $ramdisk;
-  rm -rf $bootimg $split_img $home/*-new*;
+  rm -rf $bootimg $split_img $home/*-new* $home/*-files/current;
 
   if [ "$1" == "keep" ]; then
     [ -d $home/rdtmp ] && mv -f $home/rdtmp $ramdisk;
@@ -829,18 +806,13 @@ reset_ak() {
 
 # setup_ak
 setup_ak() {
-  local plistboot plistinit plistreco parttype name part mtdmount mtdpart mtdname target;
+  local blockfiles plistboot plistinit plistreco parttype name part mtdmount mtdpart mtdname target;
 
   # slot detection enabled by is_slot_device=1 or auto (from anykernel.sh)
   case $is_slot_device in
     1|auto)
       slot=$(getprop ro.boot.slot_suffix 2>/dev/null);
       [ "$slot" ] || slot=$(grep -o 'androidboot.slot_suffix=.*$' /proc/cmdline | cut -d\  -f1 | cut -d= -f2);
-      if [ ! "$slot" ]; then
-        if [ -e /proc/bootconfig ]; then
-          slot=$(cat /proc/bootconfig | grep -E '^androidboot.slot_suffix = ' | awk '{print $3}' | sed 's/^"//; s/"$//');
-        fi;
-      fi;
       if [ ! "$slot" ]; then
         slot=$(getprop ro.boot.slot 2>/dev/null);
         [ "$slot" ] || slot=$(grep -o 'androidboot.slot=.*$' /proc/cmdline | cut -d\  -f1 | cut -d= -f2);
@@ -870,6 +842,30 @@ setup_ak() {
   cd $home;
   rm -f modules/system/lib/modules/placeholder patch/placeholder ramdisk/placeholder;
   rmdir -p modules patch ramdisk 2>/dev/null;
+
+  # automate simple multi-partition setup for hdr_v4 boot + init_boot + vendor_kernel_boot (for dtb only until magiskboot supports hdr v4 vendor_ramdisk unpack/repack)
+  if [ -e "/dev/block/bootdevice/by-name/init_boot$slot" -a ! -f init_v4_setup ] && [ -f dtb -o -d vendor_ramdisk -o -d vendor_patch ]; then
+    echo "Setting up for simple automatic init_boot flashing..." >&2;
+    (mkdir boot-files;
+    mv -f Image* boot-files;
+    mkdir init_boot-files;
+    mv -f ramdisk patch init_boot-files;
+    mkdir vendor_kernel_boot-files;
+    mv -f dtb vendor_kernel_boot-files;
+    mv -f vendor_ramdisk vendor_kernel_boot-files/ramdisk;
+    mv -f vendor_patch vendor_kernel_boot-files/patch) 2>/dev/null;
+    touch init_v4_setup;
+  # automate simple multi-partition setup for hdr_v3+ boot + vendor_boot with dtb/dlkm (for v3 only until magiskboot supports hdr v4 vendor_ramdisk unpack/repack)
+  elif [ -e "/dev/block/bootdevice/by-name/vendor_boot$slot" -a ! -f vendor_v3_setup ] && [ -f dtb -o -d vendor_ramdisk -o -d vendor_patch ]; then
+    echo "Setting up for simple automatic vendor_boot flashing..." >&2;
+    (mkdir boot-files;
+    mv -f Image* ramdisk patch boot-files;
+    mkdir vendor_boot-files;
+    mv -f dtb vendor_boot-files;
+    mv -f vendor_ramdisk vendor_boot-files/ramdisk;
+    mv -f vendor_patch vendor_boot-files/patch) 2>/dev/null;
+    touch vendor_v3_setup;
+  fi;
 
   # target block partition detection enabled by block=<partition filename> or auto (from anykernel.sh)
   case $block in
@@ -927,6 +923,22 @@ setup_ak() {
   if [ ! "$no_block_display" ]; then
     ui_print "$block";
   fi;
+
+  # allow multi-partition ramdisk modifying configurations (using reset_ak)
+  name=$(basename $block | sed -e 's/_a$//' -e 's/_b$//');
+  if [ "$block" ] && [ ! -d "$ramdisk" -a ! -d "$patch" ]; then
+    blockfiles=$home/$name-files;
+    if [ "$(ls $blockfiles 2>/dev/null)" ]; then
+      cp -af $blockfiles/* $home;
+    else
+      mkdir $blockfiles;
+    fi;
+    touch $blockfiles/current;
+  fi;
+
+  # run attributes function for current block if it exists
+  type attributes >/dev/null 2>&1 && attributes; # backwards compatibility
+  type ${name}_attributes >/dev/null 2>&1 && ${name}_attributes;
 }
 ###
 
